@@ -1,7 +1,11 @@
+import requests
+
 from django.db import models
 from django.contrib.postgres.fields import JSONField
 from django.db.models.signals import post_save
 from django.dispatch import receiver
+
+import urllib
 
 from base import mods
 from base.models import Auth, Key
@@ -42,81 +46,59 @@ class Voting(models.Model):
     tally = JSONField(blank=True, null=True)
     postproc = JSONField(blank=True, null=True)
 
+    url = models.CharField(max_length=40)
+
+    def save(self, *args, **kwargs):
+        self.url = urllib.parse.quote_plus(self.url.encode('utf-8'))
+        super(Voting, self).save(*args, **kwargs)
+
     def create_pubkey(self):
         if self.pub_key or not self.auths.count():
             return
 
         auth = self.auths.first()
+        url = "{}/mixnet/".format(auth.url)
         data = {
             "voting": self.id,
             "auths": [ {"name": a.name, "url": a.url} for a in self.auths.all() ],
         }
-        key = mods.post('mixnet', baseurl=auth.url, json=data)
+        resp = requests.post(url, json=data)
+        key = resp.json()
         pk = Key(p=key["p"], g=key["g"], y=key["y"])
         pk.save()
         self.pub_key = pk
         self.save()
 
-    def get_votes(self, token=''):
+    def get_votes(self):
+        STORE = settings.APIS.get('store', settings.BASEURL)
         # gettings votes from store
-        votes = mods.get('store', params={'voting_id': self.id}, HTTP_AUTHORIZATION='Token ' + token)
+        response = requests.get('{}/store/?voting_id={}'.format(STORE, self.id))
+        votes = response.json()
         # anon votes
         return [[i['a'], i['b']] for i in votes]
 
-    def tally_votes(self, token=''):
+    def tally_votes(self):
         '''
         The tally is a shuffle and then a decrypt
         '''
 
-        votes = self.get_votes(token)
+        votes = self.get_votes()
 
         auth = self.auths.first()
-        shuffle_url = "/shuffle/{}/".format(self.id)
-        decrypt_url = "/decrypt/{}/".format(self.id)
+        shuffle_url = "{}/mixnet/shuffle/{}/".format(auth.url, self.id)
+        decrypt_url = "{}/mixnet/decrypt/{}/".format(auth.url, self.id)
         auths = [{"name": a.name, "url": a.url} for a in self.auths.all()]
 
         # first, we do the shuffle
         data = { "msgs": votes }
-        response = mods.post('mixnet', entry_point=shuffle_url, baseurl=auth.url, json=data,
-                response=True)
-        if response.status_code != 200:
-            # TODO: manage error
-            pass
-
+        resp = requests.post(shuffle_url, json=data)
+        shuffled = resp.json()
         # then, we can decrypt that
-        data = {"msgs": response.json()}
-        response = mods.post('mixnet', entry_point=decrypt_url, baseurl=auth.url, json=data,
-                response=True)
+        data = { "msgs": shuffled }
+        response = requests.post(decrypt_url, json=data)
+        clear = response.json()
 
-        if response.status_code != 200:
-            # TODO: manage error
-            pass
-
-        self.tally = response.json()
-        self.save()
-
-        self.do_postproc()
-
-    def do_postproc(self):
-        tally = self.tally
-        options = self.question.options.all()
-
-        opts = []
-        for opt in options:
-            if isinstance(tally, list):
-                votes = tally.count(opt.number)
-            else:
-                votes = 0
-            opts.append({
-                'option': opt.option,
-                'number': opt.number,
-                'votes': votes
-            })
-
-        data = { 'type': 'IDENTITY', 'options': opts }
-        postp = mods.post('postproc', json=data)
-
-        self.postproc = postp
+        self.tally = clear
         self.save()
 
     def __str__(self):
